@@ -1,271 +1,435 @@
-#!/bin/bash
-# Refactored GitHub Issue Creation Script
-set -euo pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
+shopt -s inherit_errexit
 
-# === CONFIGURATION ===
-ASSIGNEE="${1:-$(gh api user --jq '.login')}"
-LABEL_FILTER="${2:-}"
-ISSUES_DIR=".github/issues"
+# ==============================================================================
+# issues.sh – Batch create GitHub issues from Markdown templates
+# ==============================================================================
 
-# === COLORS & ICONS ===
-# Theme colors
-GREEN='\033[1;32m'
-ORANGE='\033[1;33m' # Using 1;33m for consistent bold orange
-RED='\033[1;31m'
-WHITE='\033[1;37m'
-BLUE='\033[1;34m'
-PURPLE='\033[1;35m'
-CYAN='\033[1;36m'
-NC='\033[0m'
-BOLD='\033[1m'
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+readonly DEFAULT_ISSUES_DIR=".github/issues"
 
-# Icons without embedded color codes; colors are applied by log functions or printf
-ICON_PASS="✓"
-ICON_FAIL="✗"
-ICON_WARN="💡"
-ICON_INFO="ℹ"
-ICON_SKIP="➤"
+# ------------------------------------------------------------------------------
+# Terminal colors using tput (with fallback)
+# ------------------------------------------------------------------------------
+if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
+    BOLD=$(tput bold)
+    GREEN=$(tput setaf 2)
+    ORANGE=$(tput setaf 208)
+    RED=$(tput setaf 1)
+    WHITE=$(tput setaf 7)
+    BLUE=$(tput setaf 4)
+    PURPLE=$(tput setaf 5)
+    CYAN=$(tput setaf 6)
+    NC=$(tput sgr0)
+else
+    BOLD=""
+    GREEN=""
+    ORANGE=""
+    RED=""
+    WHITE=""
+    BLUE=""
+    PURPLE=""
+    CYAN=""
+    NC=""
+fi
 
-# Custom icons for this script (also without embedded color codes)
-ICON_SUCCESS="${ICON_PASS}" # Reusing ICON_PASS
-ICON_ON_TRACK="⚪"
-ICON_OVERDUE="✗" # Reusing ICON_FAIL
-ICON_PROCESSING="🟡"
-ICON_NEXT_UPCOMING="🟠"
+readonly ICON_PASS="${GREEN}✓${NC}"
+readonly ICON_WARN="${ORANGE}⚠${NC}"
+readonly ICON_FAIL="${RED}✗${NC}"
+readonly ICON_INFO="${BLUE}ℹ${NC}"
+readonly ICON_SKIP="${WHITE}○${NC}"
 
-# Bigger icons for summary (also without embedded color codes)
-GREEN_CIRCLE="🟢"
-WHITE_CIRCLE="⚪"
-RED_CIRCLE="🔴"
-WARNING_ICON="⚠️"
+# ------------------------------------------------------------------------------
+# Global state
+# ------------------------------------------------------------------------------
+declare -A COUNTS=( ["pass"]=0 ["warn"]=0 ["fail"]=0 ["info"]=0 ["skip"]=0 )
+declare -a CHECK_RESULTS=()
+declare -A EXISTING_ISSUES
 
+# ------------------------------------------------------------------------------
+# Logging functions (bold messages)
+# ------------------------------------------------------------------------------
+log_info()    { echo -e "${ICON_INFO} ${BLUE}${BOLD}$*${NC}" >&2; COUNTS["info"]=$((COUNTS["info"]+1)); CHECK_RESULTS+=("info"); }
+log_warn()    { echo -e "${ICON_WARN} ${ORANGE}${BOLD}$*${NC}" >&2; COUNTS["warn"]=$((COUNTS["warn"]+1)); CHECK_RESULTS+=("warn"); }
+log_success() { echo -e "${ICON_PASS} ${GREEN}${BOLD}$*${NC}" >&2; COUNTS["pass"]=$((COUNTS["pass"]+1)); CHECK_RESULTS+=("pass"); }
+log_error()   { echo -e "${ICON_FAIL} ${RED}${BOLD}$*${NC}" >&2; COUNTS["fail"]=$((COUNTS["fail"]+1)); CHECK_RESULTS+=("fail"); }
 
-# === FUNCTIONS ===
-
-# Function to get display width of a string (handles multi-byte chars/emojis)
-get_display_width() {
-    echo -n "$1" | wc -m
+# Special log for duplicate issues – color depends on state, but both are counted as "skip"
+log_duplicate() {
+    local state="$1"
+    local number="$2"
+    local title="$3"
+    local message="Issue already exists (${state}): #${number} - ${title}"
+    if [[ "$state" == "OPEN" ]]; then
+        echo -e "${ICON_SKIP} ${WHITE}${BOLD}${message}${NC}" >&2
+    else
+        echo -e "${ICON_SKIP} ${RED}${BOLD}${message}${NC}" >&2
+    fi
+    COUNTS["skip"]=$((COUNTS["skip"]+1))
+    CHECK_RESULTS+=("skip")
 }
 
-# Log functions now apply color and reset at the end of the line
-log_info()    { printf "%b%s %s%b\n" "${BLUE}" "${ICON_INFO}" "$1" "${NC}"; }
-log_warn()    { printf "%b%s %s%b\n" "${ORANGE}" "${ICON_WARN}" "$1" "${NC}"; }
-log_success() { printf "%b%s %s%b\n" "${GREEN}" "${ICON_SUCCESS}" "$1" "${NC}"; }
-log_error()   { printf "%b%s %s%b\n" "${RED}" "${ICON_FAIL}" "$1" "${NC}"; exit 1; }
-log_skip()    { printf "%b%s %s%b\n" "${WHITE}" "${ICON_SKIP}" "$1" "${NC}"; }
-
-# Function to print a status line with a colored icon and message
-print_status_line() {
-    local title=$1 icon_char=$2 status_text=$3
-    local color_code # Determine color based on icon_char for this specific function
-
-    case "$icon_char" in
-        "${ICON_ON_TRACK}") color_code="${WHITE}" ;;
-        "${ICON_SUCCESS}") color_code="${GREEN}" ;;
-        "${ICON_FAIL}") color_code="${RED}" ;;
-        *) color_code="${WHITE}" ;; # Default color
-    esac
-
-    # Calculate max title length for alignment across all calls to this function
-    # This assumes print_status_line is called in a loop where max_title_len can be determined
-    # For simplicity here, we'll calculate it on the fly, but for perfect column alignment
-    # across *all* print_status_line calls, a two-pass approach (like in print_aligned_results)
-    # would be needed. For this script, the current usage is mostly sequential, so this works.
-    local max_title_len=0
-    # A simplified approach for this script's context:
-    # Find the max length of the titles that will be printed by this function
-    # This would ideally be done globally or passed in. For now, we'll assume a reasonable fixed width
-    # or rely on the natural flow if titles are similar in length.
-    # To make it robust, we need to gather all titles first, then print.
-    # Since this function is called inside a loop for issue creation,
-    # we'll make it align based on the longest title encountered so far, or a fixed reasonable length.
-    # Let's assume a reasonable max for now, or you'd collect all titles first.
-    # For now, let's use a fixed width that accommodates common titles, or you can make it dynamic
-    # by collecting all titles and finding the max length before printing.
-    # Given the context of the issues.sh, a fixed width is simpler and likely sufficient
-    # if titles are generally similar in length.
-    local fixed_title_width=40 # Adjust this based on expected max title length
-
-    local current_title_display_len=$(get_display_width "$title")
-    local padding_needed=$((fixed_title_width - current_title_display_len))
-    local padded_title="${title}"
-    for ((i=0; i<padding_needed; i++)); do padded_title+=" "; done
-
-    # Format: "  <icon> → <padded_title> ⇒ <status_text>"
-    printf "%b  %s %s %s %s %s%b\n" \
-        "${color_code}" \
-        "${icon_char}" \
-        "→" \
-        "${padded_title}" \
-        "⇒" \
-        "${status_text}" \
-        "${NC}"
+fatal() {
+    echo -e "\n${ICON_FAIL} ${RED}${BOLD}FATAL ERROR: $1${NC}" >&2
+    exit 1
 }
 
+# ------------------------------------------------------------------------------
+# Tool validation
+# ------------------------------------------------------------------------------
+validate_required_tools() {
+    local required_tools=("gh" "jq" "git")
+    local missing=()
+    for tool in "${required_tools[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    if command -v yq >/dev/null 2>&1; then
+        log_info "yq found – using for YAML parsing"
+    else
+        log_warn "yq not found – falling back to basic grep/sed (may be less reliable)"
+    fi
+    [[ ${#missing[@]} -eq 0 ]] || fatal "Missing required tools: ${missing[*]}"
+    log_success "All required tools are available"
+}
 
+# ------------------------------------------------------------------------------
+# Text normalization for duplicate detection
+# ------------------------------------------------------------------------------
 normalize_title() {
-    echo "$1" | perl -CSDA -pe 's/\p{So}//g' | sed 's/[^[:alnum:]]//g' | tr '[:upper:]' '[:lower:]'
+    echo "$1" | perl -CSDA -pe 's/\p{So}//g' 2>/dev/null | sed 's/[^[:alnum:]]//g' | tr '[:upper:]' '[:lower:]' \
+        || echo "$1" | tr -d '[:punct:]' | tr '[:upper:]' '[:lower:]'
 }
 
-declare -A known_labels=()
-declare -a existing_labels_lower=()
-
-cache_existing_labels() {
-    mapfile -t existing_labels_lower < <(gh label list --limit 1000 | awk '{print tolower($1)}')
+# ------------------------------------------------------------------------------
+# Cache existing issues (both open and closed)
+# ------------------------------------------------------------------------------
+cache_existing_issues() {
+    log_info "Fetching existing issues (open and closed) from GitHub..."
+    local all_issues
+    all_issues=$(gh issue list --state all --limit 1000 --json title,number,state 2>/dev/null || echo '[]')
+    EXISTING_ISSUES=()
+    local count=0
+    while IFS= read -r issue; do
+        [[ -z "$issue" ]] && continue
+        local title=$(echo "$issue" | jq -r '.title')
+        local number=$(echo "$issue" | jq -r '.number')
+        local state=$(echo "$issue" | jq -r '.state')   # "OPEN" or "CLOSED"
+        local normalized=$(normalize_title "$title")
+        EXISTING_ISSUES["$normalized"]="$state|$number|$title"
+        count=$((count+1))
+    done < <(echo "$all_issues" | jq -c '.[]')
+    log_success "Cached $count existing issues (open + closed)"
 }
 
-create_label_if_needed() {
-    local label_name="$1"
-    label_name=$(echo "$label_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '"')
-
-    if [[ -n "${known_labels[$label_name]:-}" ]]; then return 0; fi
-
-    local lower_label=$(echo "$label_name" | tr '[:upper:]' '[:lower:]')
-    if printf "%s\n" "${existing_labels_lower[@]}" | grep -qx "$lower_label"; then
-        known_labels[$label_name]=1
+# ------------------------------------------------------------------------------
+# Check if an issue already exists (by normalized title)
+# Sets globals: EXISTING_STATE, EXISTING_NUMBER, EXISTING_TITLE
+# ------------------------------------------------------------------------------
+issue_exists() {
+    local normalized="$1"
+    if [[ -n "${EXISTING_ISSUES[$normalized]:-}" ]]; then
+        IFS='|' read -r EXISTING_STATE EXISTING_NUMBER EXISTING_TITLE <<< "${EXISTING_ISSUES[$normalized]}"
         return 0
     fi
-
-    if gh label create "$label_name" --color "$(echo "$label_name" | sha256sum | head -c 6)" &>/dev/null; then
-        known_labels[$label_name]=1
-        existing_labels_lower+=("$lower_label")
-        return 0
-    fi
-
     return 1
 }
 
+# ------------------------------------------------------------------------------
+# Parse YAML frontmatter from an issue markdown file
+# Sets globals: ISSUE_TITLE, ISSUE_MILESTONE, ISSUE_LABELS_ARRAY, ISSUE_ASSIGNEES_ARRAY
+# ------------------------------------------------------------------------------
+parse_issue_metadata() {
+    local file="$1"
+    ISSUE_TITLE=""
+    ISSUE_MILESTONE=""
+    ISSUE_LABELS_ARRAY=()
+    ISSUE_ASSIGNEES_ARRAY=()
+
+    local frontmatter
+    frontmatter=$(awk '/^---$/ { if (++n == 1) next; if (n == 2) exit } n == 1' "$file")
+
+    if [[ -z "$frontmatter" ]]; then
+        log_error "No YAML frontmatter found in $file"
+        return 1
+    fi
+
+    if command -v yq >/dev/null 2>&1; then
+        ISSUE_TITLE=$(echo "$frontmatter" | yq eval '.title' - 2>/dev/null | sed 's/^"//;s/"$//')
+        ISSUE_MILESTONE=$(echo "$frontmatter" | yq eval '.milestone' - 2>/dev/null | sed 's/^"//;s/"$//')
+        local labels_raw
+        labels_raw=$(echo "$frontmatter" | yq eval '.labels' - 2>/dev/null)
+        if [[ "$labels_raw" != "null" ]]; then
+            if [[ "$labels_raw" =~ ^\[.*\]$ ]]; then
+                mapfile -t ISSUE_LABELS_ARRAY < <(echo "$frontmatter" | yq eval '.labels[]' - 2>/dev/null)
+            else
+                ISSUE_LABELS_ARRAY=("$labels_raw")
+            fi
+        fi
+        local assignees_raw
+        assignees_raw=$(echo "$frontmatter" | yq eval '.assignees' - 2>/dev/null)
+        if [[ "$assignees_raw" != "null" ]]; then
+            if [[ "$assignees_raw" =~ ^\[.*\]$ ]]; then
+                mapfile -t ISSUE_ASSIGNEES_ARRAY < <(echo "$frontmatter" | yq eval '.assignees[]' - 2>/dev/null)
+            else
+                ISSUE_ASSIGNEES_ARRAY=("$assignees_raw")
+            fi
+        fi
+    else
+        ISSUE_TITLE=$(echo "$frontmatter" | grep -m1 '^title:' | sed 's/^title: *//;s/^"//;s/"$//')
+        ISSUE_MILESTONE=$(echo "$frontmatter" | grep -m1 '^milestone:' | sed 's/^milestone: *//;s/^"//;s/"$//')
+        local labels_line
+        labels_line=$(echo "$frontmatter" | grep -m1 '^labels:' | sed 's/^labels: *//')
+        if [[ -n "$labels_line" ]]; then
+            labels_line=$(echo "$labels_line" | sed 's/[][]//g')
+            IFS=',' read -ra ISSUE_LABELS_ARRAY <<< "$labels_line"
+            for i in "${!ISSUE_LABELS_ARRAY[@]}"; do
+                ISSUE_LABELS_ARRAY[$i]=$(echo "${ISSUE_LABELS_ARRAY[$i]}" | sed 's/^ *//;s/ *$//')
+            done
+        fi
+        local assignees_line
+        assignees_line=$(echo "$frontmatter" | grep -m1 '^assignees:' | sed 's/^assignees: *//')
+        if [[ -n "$assignees_line" ]]; then
+            assignees_line=$(echo "$assignees_line" | sed 's/[][]//g')
+            IFS=',' read -ra ISSUE_ASSIGNEES_ARRAY <<< "$assignees_line"
+            for i in "${!ISSUE_ASSIGNEES_ARRAY[@]}"; do
+                ISSUE_ASSIGNEES_ARRAY[$i]=$(echo "${ISSUE_ASSIGNEES_ARRAY[$i]}" | sed 's/^ *//;s/ *$//')
+            done
+        fi
+    fi
+
+    ISSUE_TITLE=$(echo "$ISSUE_TITLE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    ISSUE_MILESTONE=$(echo "$ISSUE_MILESTONE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    if [[ -z "$ISSUE_TITLE" ]]; then
+        log_error "Missing 'title' in $file"
+        return 1
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# Create a single issue from a markdown file
+# Returns: 0 = created, 1 = skipped (duplicate open or closed), 2 = error
+# ------------------------------------------------------------------------------
 create_issue_from_file() {
     local file="$1"
-    local raw_title=$(awk -F': ' '/^title:/ {print $2; exit}' "$file")
-    local clean_title=$(echo "$raw_title" | sed 's/^"//;s/"$//' | xargs)
-    local compare_title=$(normalize_title "$clean_title")
+    local assignee_override="$2"
+    local dry_run="${3:-false}"
 
-    local existing_titles
-    mapfile -t existing_titles < <(gh issue list --limit 1000 --json title --jq '.[].title')
-
-    for title in "${existing_titles[@]}"; do
-        if [[ "$(normalize_title "$title")" == "$compare_title" ]]; then
-            print_status_line "$clean_title" "$ICON_ON_TRACK" "Already exists"
-            return 1 # Return 1 for skipped, as per original logic flow
-        fi
-    done
-
-    local labels=$(awk -F': ' '/^labels:/ {print $2; exit}' "$file" | tr -d '[]"' | tr ',' '\n' | xargs -n1)
-
-    # Check label filter match
-    if [[ -n "$LABEL_FILTER" ]]; then
-        local found_match=0
-        for label in $labels; do
-            if [[ "${label,,}" == "${LABEL_FILTER,,}" ]]; then
-                found_match=1
-                break
-            fi
-        done
-        if [[ $found_match -eq 0 ]]; then
-            print_status_line "$clean_title" "${ICON_SKIP}" "Filtered out by label" # Explicitly log skipped by filter
-            return 1 # Return 1 for skipped
-        fi
+    if ! parse_issue_metadata "$file"; then
+        return 2
     fi
 
-    local milestone=$(awk -F': ' '/^milestone:/ {print $2; exit}' "$file" | tr -d '"')
-    local milestone_arg=()
-    if [[ -n "$milestone" ]]; then
-        milestone_arg=("--milestone" "$milestone")
+    local normalized_title
+    normalized_title=$(normalize_title "$ISSUE_TITLE")
+    if issue_exists "$normalized_title"; then
+        log_duplicate "$EXISTING_STATE" "$EXISTING_NUMBER" "$ISSUE_TITLE"
+        return 1   # skip regardless of state
     fi
 
-    local body=$(awk '/^---$/ {count++; next} count >= 2 {print}' "$file")
+    local body
+    body=$(awk '/^---$/{f++; next} f>=2' "$file")
 
     local label_args=()
-    for label in $labels; do
-        if create_label_if_needed "$label"; then
-            label_args+=("-l" "$label")
-        fi
+    for label in "${ISSUE_LABELS_ARRAY[@]}"; do
+        [[ -n "$label" ]] && label_args+=("--label" "$label")
     done
 
-    if issue_url=$(gh issue create -t "$clean_title" -b "$body" --assignee "$ASSIGNEE" "${label_args[@]}" "${milestone_arg[@]}" 2>/dev/null); then
-        print_status_line "$clean_title" "$ICON_SUCCESS" "Created"
+    local assignee_arg=""
+    if [[ ${#ISSUE_ASSIGNEES_ARRAY[@]} -gt 0 ]]; then
+        assignee_arg="--assignee ${ISSUE_ASSIGNEES_ARRAY[0]}"
+    elif [[ -n "$assignee_override" ]]; then
+        assignee_arg="--assignee $assignee_override"
+    fi
+
+    local milestone_arg=""
+    if [[ -n "$ISSUE_MILESTONE" ]]; then
+        milestone_arg="--milestone \"$ISSUE_MILESTONE\""
+    fi
+
+    if [[ "$dry_run" == "true" ]]; then
+        log_info "[DRY RUN] Would create issue: $ISSUE_TITLE"
+        return 0
+    fi
+
+    local issue_url
+    local cmd="gh issue create --title \"$ISSUE_TITLE\" --body \"$body\" $assignee_arg ${label_args[*]} $milestone_arg"
+    if issue_url=$(eval "$cmd" 2>/dev/null); then
+        log_success "Created issue: $ISSUE_TITLE → $issue_url"
         return 0
     else
-        print_status_line "$clean_title" "$ICON_OVERDUE" "Failed" # Using ICON_OVERDUE for failed
+        log_error "Failed to create issue: $ISSUE_TITLE"
         return 2
     fi
 }
 
+# ------------------------------------------------------------------------------
+# Output helpers (progress bar, summary, signature)
+# ------------------------------------------------------------------------------
+print_progress_bar() {
+    local total=${#CHECK_RESULTS[@]}
+    [[ $total -eq 0 ]] && return
+    local bar=""
+    for r in "${CHECK_RESULTS[@]}"; do
+        case "$r" in
+            "pass") bar+="🟩" ;;
+            "warn") bar+="🟧" ;;
+            "fail") bar+="🟥" ;;
+            "info") bar+="🟦" ;;
+            "skip") bar+="⬛" ;;
+        esac
+    done
+    echo -e "\n${WHITE}Progress: [${bar}] 100% (${total}/${total} checks)${NC}"
+}
+
+print_summary() {
+    echo -e "\n${CYAN}${BOLD}📊 Summary:${NC}"
+    printf "%b  ${GREEN}${BOLD}Created${NC}   ${GREEN}🟢  ⇒ ${GREEN}${BOLD}%d${NC}%b\n" "${ICON_PASS}" "${COUNTS[pass]}" "${NC}"
+    printf "%b  ${WHITE}${BOLD}Skipped${NC}   ${WHITE}⚫  ⇒ ${WHITE}${BOLD}%d${NC}%b\n" "${ICON_SKIP}" "${COUNTS[skip]}" "${NC}"
+    printf "%b  ${RED}${BOLD}Failed${NC}    ${RED}🔴  ⇒ ${RED}${BOLD}%d${NC}%b\n" "${ICON_FAIL}" "${COUNTS[fail]}" "${NC}"
+    printf "%b  ${BLUE}${BOLD}Info${NC}      ${BLUE}🔵  ⇒ ${BLUE}${BOLD}%d${NC}%b\n" "${ICON_INFO}" "${COUNTS[info]}" "${NC}"
+    printf "%b  ${ORANGE}${BOLD}Warnings${NC}  ${ORANGE}🟠  ⇒ ${ORANGE}${BOLD}%d${NC}%b\n" "${ICON_WARN}" "${COUNTS[warn]}" "${NC}"
+}
+
+print_signature() {
+    echo -e "\n${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}                          Author Details                                  ${NC}"
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}${BOLD}ANUJ KUMAR${NC}"
+    echo -e "${CYAN}🏅 QA Lead & AI-Assisted Testing Specialist${NC}"
+    echo -e "${ORANGE}📧 Email: ${BLUE}anujpatiyal@live.in${NC}"
+    echo -e "${ORANGE}🔗 LinkedIn: ${BLUE}https://www.linkedin.com/in/anuj-kumar-qa/${NC}"
+    echo -e "\n${WHITE}Completed at: $(date +"%d-%b-%Y %H:%M:%S")${NC}\n"
+}
+
+print_banner() {
+    echo -e "\n${PURPLE}╔══════════════════════════════════════════════════════════════╗"
+    echo -e "║${NC}${PURPLE}          📝  G I T H U B   I S S U E   C R E A T O R        ${NC}${PURPLE}║"
+    echo -e "╚══════════════════════════════════════════════════════════════╝${NC}"
+}
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
 main() {
-    if [[ ! -d "$ISSUES_DIR" ]]; then
-        echo -e "${RED}❌ Directory '$ISSUES_DIR' not found.${NC}"
-        exit 1
+    local start_time=$(date +%s)
+    print_banner
+
+    local assignee=""
+    local label_filter=""
+    local issues_dir="$DEFAULT_ISSUES_DIR"
+    local dry_run=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --assignee) assignee="$2"; shift 2 ;;
+            --label-filter) label_filter="$2"; shift 2 ;;
+            --issues-dir) issues_dir="$2"; shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
+            -h|--help)
+                cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --assignee USER      Assign created issues to this GitHub user (default: authenticated user)
+  --label-filter LABEL Only process issues containing this label (case-insensitive)
+  --issues-dir DIR     Directory containing issue markdown files (default: .github/issues)
+  --dry-run            Simulate creation without calling GitHub API
+  -h, --help           Show this help
+EOF
+                exit 0
+                ;;
+            *) fatal "Unknown option: $1" ;;
+        esac
+    done
+
+    validate_required_tools
+
+    if [[ "$dry_run" == "false" ]]; then
+        if ! gh auth status >/dev/null 2>&1; then
+            fatal "GitHub CLI not authenticated. Run 'gh auth login'."
+        fi
     fi
 
-    cache_existing_labels
+    if [[ -z "$assignee" ]] && [[ "$dry_run" == "false" ]]; then
+        assignee=$(gh api user --jq '.login' 2>/dev/null || echo "")
+        [[ -z "$assignee" ]] && fatal "Could not determine current GitHub user. Specify --assignee."
+    fi
 
-    echo -e "\n${CYAN}🚀 Starting issue creation from '$ISSUES_DIR'...${NC}"
-    local created=0 skipped=0 failed=0 total=0
-    local current_count=0
+    if [[ ! -d "$issues_dir" ]]; then
+        fatal "Directory not found: $issues_dir"
+    fi
 
-    local file_list=("$ISSUES_DIR"/*.md)
-    for file in "${file_list[@]}"; do
+    if [[ "$dry_run" == "false" ]]; then
+        cache_existing_issues
+    else
+        log_info "DRY RUN: Skipping cache of existing issues"
+    fi
+
+    local files=("$issues_dir"/*.md)
+    if [[ ${#files[@]} -eq 1 && ! -f "${files[0]}" ]]; then
+        fatal "No .md files found in $issues_dir"
+    fi
+
+    log_info "Processing ${#files[@]} issue template(s) from $issues_dir"
+    if [[ -n "$assignee" ]]; then
+        log_info "Assignee: $assignee"
+    fi
+    [[ -n "$label_filter" ]] && log_info "Label filter: $label_filter"
+
+    local created=0 skipped=0 failed=0
+
+    for file in "${files[@]}"; do
         [[ -f "$file" ]] || continue
-        total=$((total + 1))
-    done
 
-    for file in "${file_list[@]}"; do
-        [[ -f "$file" ]] || continue
-        current_count=$((current_count + 1))
-        if create_issue_from_file "$file"; then
-            created=$((created + 1))
-        else
-            status=$?
-            if [[ $status -eq 1 ]]; then
-                skipped=$((skipped + 1))
-            else
-                failed=$((failed + 1))
+        if [[ -n "$label_filter" ]]; then
+            parse_issue_metadata "$file" >/dev/null 2>&1
+            local found=false
+            for lbl in "${ISSUE_LABELS_ARRAY[@]}"; do
+                if [[ "${lbl,,}" == "${label_filter,,}" ]]; then
+                    found=true
+                    break
+                fi
+            done
+            if [[ "$found" == "false" ]]; then
+                log_skip "Skipping $file (does not contain label '$label_filter')"
+                skipped=$((skipped+1))
+                continue
             fi
         fi
+
+        set +e
+        create_issue_from_file "$file" "$assignee" "$dry_run"
+        local exit_code=$?
+        set -e
+
+        case $exit_code in
+            0) created=$((created+1)) ;;
+            1) skipped=$((skipped+1)) ;;
+            2) failed=$((failed+1)) ;;
+        esac
     done
 
-    echo -e "\n${BOLD}${PURPLE}📊 Issue Creation Summary:${NC}"
+    COUNTS["pass"]=$created
+    COUNTS["skip"]=$skipped
+    COUNTS["fail"]=$failed
 
-    local max_summary_label_len=0
-    # Determine max width for the label column (e.g., "✓ Created")
-    local summary_labels_to_measure=("${ICON_PASS} Created" "${ICON_SKIP} Skipped" "${ICON_FAIL} Failed")
-    for label_str in "${summary_labels_to_measure[@]}"; do
-        local current_len=$(get_display_width "$label_str")
-        if (( current_len > max_summary_label_len )); then
-            max_summary_label_len="$current_len"
-        fi
-    done
+    print_progress_bar
+    print_summary
+    print_signature
 
-    # Add some buffer for aesthetics (e.g., 2 spaces for gap)
-    max_summary_label_len=$((max_summary_label_len + 2))
+    local end_time=$(date +%s)
+    echo -e "\n${WHITE}⏱ Completed in $((end_time - start_time)) seconds${NC}"
 
-    # Print summary with calculated alignment
-    local padded_label_part
-
-    # Created line
-    local label_text="${ICON_PASS} Created"
-    local current_label_display_len=$(get_display_width "$label_text")
-    local padding_needed=$((max_summary_label_len - current_label_display_len))
-    padded_label_part="${label_text}"
-    for ((i=0; i<padding_needed; i++)); do padded_label_part+=" "; done
-    printf "%b  %s%3d%b\n" "${GREEN}${BOLD}" "$padded_label_part" "$created" "${NC}"
-
-    # Skipped line
-    label_text="${ICON_SKIP} Skipped"
-    current_label_display_len=$(get_display_width "$label_text")
-    padding_needed=$((max_summary_label_len - current_label_display_len))
-    padded_label_part="${label_text}"
-    for ((i=0; i<padding_needed; i++)); do padded_label_part+=" "; done
-    printf "%b  %s%3d%b\n" "${WHITE}${BOLD}" "$padded_label_part" "$skipped" "${NC}"
-
-    # Failed line
-    label_text="${ICON_FAIL} Failed"
-    current_label_display_len=$(get_display_width "$label_text")
-    padding_needed=$((max_summary_label_len - current_label_display_len))
-    padded_label_part="${label_text}"
-    for ((i=0; i<padding_needed; i++)); do padded_label_part+=" "; done
-    printf "%b  %s%3d%b\n" "${RED}${BOLD}" "$padded_label_part" "$failed" "${NC}"
+    if [[ $failed -gt 0 ]]; then
+        echo -e "\n${RED}❌ Issue creation completed with ${failed} failure(s).${NC}"
+        exit 1
+    else
+        echo -e "\n${GREEN}🎉 Successfully processed ${created} new issue(s).${NC}"
+    fi
 }
 
 main "$@"
